@@ -8,8 +8,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Find Vulkan
 find_package(Vulkan REQUIRED)
 
-# Fetch GLFW
+# Fetch dependencies
 include(FetchContent)
+
 FetchContent_Declare(
     glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
@@ -18,7 +19,14 @@ FetchContent_Declare(
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(glfw)
+
+FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG 0.9.9.8
+)
+
+FetchContent_MakeAvailable(glfw glm)
 
 # Main executable
 add_executable(vulkan_app
@@ -32,6 +40,7 @@ target_include_directories(vulkan_app PRIVATE
 target_link_libraries(vulkan_app PRIVATE
     Vulkan::Vulkan
     glfw
+    glm::glm
 )
 
 # Enable warnings
