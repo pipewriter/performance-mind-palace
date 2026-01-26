@@ -1,5 +1,9 @@
 #version 450
 
+layout(binding = 0) uniform UniformBufferObject {
+    float time;
+} ubo;
+
 // Hardcoded triangle vertices
 vec2 positions[3] = vec2[](
     vec2(0.0, -0.5),
@@ -17,6 +21,16 @@ vec3 colors[3] = vec3[](
 layout(location = 0) out vec3 fragColor;
 
 void main() {
-    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
+    vec2 pos = positions[gl_VertexIndex];
+
+    // Rotate the triangle
+    float angle = ubo.time;
+    mat2 rotation = mat2(
+        cos(angle), -sin(angle),
+        sin(angle), cos(angle)
+    );
+    pos = rotation * pos;
+
+    gl_Position = vec4(pos, 0.0, 1.0);
     fragColor = colors[gl_VertexIndex];
 }
