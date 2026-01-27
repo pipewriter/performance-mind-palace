@@ -16,6 +16,8 @@ Camera::Camera(glm::vec3 startPosition)
     , playerRadius(0.4f)  // Capsule radius
     , onGround(false)
     , noclip(false)  // Start with physics enabled (press N to toggle noclip)
+    , maxWalkableSlope(50.0f)  // 50 degrees max slope (Source engine uses ~45-50)
+    , groundNormal(0, 1, 0)  // Default up
 {
 }
 
@@ -83,17 +85,34 @@ void Camera::processKeyboard(GLFWwindow* window, float deltaTime) {
 
         if (isMoving && glm::length(moveDir) > 0.001f) {
             moveDir = glm::normalize(moveDir);
-            // Apply horizontal velocity (instant acceleration)
-            velocity.x = moveDir.x * movementSpeed;
-            velocity.z = moveDir.z * movementSpeed;
+
+            if (onGround) {
+                // On ground - instant acceleration (responsive)
+                velocity.x = moveDir.x * movementSpeed;
+                velocity.z = moveDir.z * movementSpeed;
+            } else {
+                // In air - limited air control
+                float airControl = 0.3f;  // 30% control in air
+                velocity.x += moveDir.x * movementSpeed * airControl * deltaTime;
+                velocity.z += moveDir.z * movementSpeed * airControl * deltaTime;
+
+                // Cap air speed
+                float airSpeed = glm::length(glm::vec2(velocity.x, velocity.z));
+                if (airSpeed > movementSpeed * 1.2f) {
+                    float scale = (movementSpeed * 1.2f) / airSpeed;
+                    velocity.x *= scale;
+                    velocity.z *= scale;
+                }
+            }
         } else if (onGround) {
             // Ground friction - decelerate to stop
-            float friction = 12.0f * deltaTime;  // Friction coefficient
+            float friction = 15.0f;  // Higher = faster stopping
             glm::vec2 horizontalVel(velocity.x, velocity.z);
             float speed = glm::length(horizontalVel);
 
             if (speed > 0.001f) {
-                float newSpeed = std::max(0.0f, speed - friction * speed);
+                float drop = speed * friction * deltaTime;
+                float newSpeed = std::max(0.0f, speed - drop);
                 horizontalVel = glm::normalize(horizontalVel) * newSpeed;
                 velocity.x = horizontalVel.x;
                 velocity.z = horizontalVel.y;
@@ -188,6 +207,21 @@ float sampleSDF(const ChunkManager& chunkManager, glm::vec3 worldPos) {
     return c0 * (1 - fz) + c1 * fz;
 }
 
+// Helper: Calculate SDF gradient (surface normal)
+glm::vec3 calculateSDFNormal(const ChunkManager& chunkManager, glm::vec3 pos) {
+    float step = 0.1f;
+    float dx = sampleSDF(chunkManager, pos + glm::vec3(step, 0, 0)) -
+               sampleSDF(chunkManager, pos - glm::vec3(step, 0, 0));
+    float dy = sampleSDF(chunkManager, pos + glm::vec3(0, step, 0)) -
+               sampleSDF(chunkManager, pos - glm::vec3(0, step, 0));
+    float dz = sampleSDF(chunkManager, pos + glm::vec3(0, 0, step)) -
+               sampleSDF(chunkManager, pos - glm::vec3(0, 0, step));
+
+    glm::vec3 gradient(dx, dy, dz);
+    float len = glm::length(gradient);
+    return len > 0.001f ? gradient / len : glm::vec3(0, 1, 0);
+}
+
 void Camera::updatePhysics(float deltaTime, ChunkManager& chunkManager) {
     if (noclip) {
         onGround = false;
@@ -204,75 +238,105 @@ void Camera::updatePhysics(float deltaTime, ChunkManager& chunkManager) {
     glm::vec3 desiredMove = velocity * deltaTime;
     glm::vec3 newPosition = position + desiredMove;
 
-    // Collision detection: check multiple points on capsule
+    // --- GROUND DETECTION ---
     glm::vec3 feetPos = newPosition - glm::vec3(0, playerHeight * 0.5f, 0);
-    glm::vec3 headPos = newPosition + glm::vec3(0, playerHeight * 0.5f, 0);
-
     float sdfAtFeet = sampleSDF(chunkManager, feetPos);
-    float sdfAtHead = sampleSDF(chunkManager, headPos);
-    float sdfAtCenter = sampleSDF(chunkManager, newPosition);
 
-    // Ground detection - check if feet are in solid ground
-    if (sdfAtFeet > 0.2f) {  // Small threshold to prevent jitter
-        // Push player up onto surface
-        newPosition.y = position.y;
-        velocity.y = 0.0f;
-        onGround = true;
-    } else if (sdfAtFeet > -0.5f && velocity.y <= 0.0f) {
-        // Near ground and falling - snap to ground
-        onGround = true;
-        velocity.y = 0.0f;
-    } else {
-        onGround = false;
+    onGround = false;
+
+    if (sdfAtFeet > -0.2f && velocity.y <= 0.1f) {
+        // Near or in ground - calculate ground normal
+        groundNormal = -calculateSDFNormal(chunkManager, feetPos);  // Invert (points away from solid)
+
+        // Check slope angle
+        float slopeAngle = glm::degrees(std::acos(glm::dot(groundNormal, glm::vec3(0, 1, 0))));
+
+        if (slopeAngle <= maxWalkableSlope) {
+            // Walkable slope - snap to ground
+            onGround = true;
+            velocity.y = 0.0f;
+
+            // Push out of ground if embedded
+            if (sdfAtFeet > 0.0f) {
+                newPosition.y += sdfAtFeet * 1.5f;  // Push up
+            }
+        } else {
+            // Too steep - slide down
+            onGround = false;
+            // Add downslope gravity component
+            glm::vec3 downSlope = groundNormal - glm::vec3(0, 1, 0) * glm::dot(groundNormal, glm::vec3(0, 1, 0));
+            if (glm::length(downSlope) > 0.001f) {
+                downSlope = glm::normalize(downSlope);
+                velocity += downSlope * gravity * deltaTime * 0.3f;  // Slide down slope
+            }
+        }
     }
 
-    // Head collision
+    // --- SLOPE MOVEMENT MODULATION ---
+    if (onGround && glm::length(glm::vec2(velocity.x, velocity.z)) > 0.1f) {
+        // Project horizontal velocity onto slope
+        glm::vec3 horizontalVel(velocity.x, 0, velocity.z);
+        glm::vec3 right = glm::cross(groundNormal, glm::vec3(0, 1, 0));
+        if (glm::length(right) < 0.001f) {
+            right = glm::vec3(1, 0, 0);  // Fallback
+        } else {
+            right = glm::normalize(right);
+        }
+        glm::vec3 slopeForward = glm::cross(right, groundNormal);
+        slopeForward = glm::normalize(slopeForward);
+
+        // Check if moving uphill or downhill
+        float uphillDot = glm::dot(glm::normalize(horizontalVel), slopeForward);
+        if (uphillDot > 0.1f) {
+            // Moving uphill - slow down based on slope
+            float slopeAngle = glm::degrees(std::acos(glm::dot(groundNormal, glm::vec3(0, 1, 0))));
+            float slopeFactor = 1.0f - (slopeAngle / maxWalkableSlope) * 0.5f;  // Up to 50% slower
+            velocity.x *= slopeFactor;
+            velocity.z *= slopeFactor;
+        }
+    }
+
+    // --- HEAD COLLISION ---
+    glm::vec3 headPos = newPosition + glm::vec3(0, playerHeight * 0.5f, 0);
+    float sdfAtHead = sampleSDF(chunkManager, headPos);
     if (sdfAtHead > 0.0f) {
         newPosition.y = position.y;
         velocity.y = std::min(velocity.y, 0.0f);
     }
 
-    // Horizontal collision - check center
+    // --- WALL COLLISION WITH SLIDING ---
+    float sdfAtCenter = sampleSDF(chunkManager, newPosition);
     if (sdfAtCenter > 0.0f) {
-        // Inside solid - try to push out
-        // For now, just prevent horizontal movement
-        newPosition.x = position.x;
-        newPosition.z = position.z;
-        velocity.x = 0.0f;
-        velocity.z = 0.0f;
+        // Inside wall - calculate wall normal and slide along it
+        glm::vec3 wallNormal = -calculateSDFNormal(chunkManager, newPosition);
+
+        // Push out of wall
+        newPosition += wallNormal * sdfAtCenter * 2.0f;
+
+        // Project velocity along wall (slide)
+        glm::vec3 slideVel = velocity - wallNormal * glm::dot(velocity, wallNormal);
+        velocity.x = slideVel.x;
+        velocity.z = slideVel.z;
     }
 
     position = newPosition;
 
-    // CAMERA CLIPPING FIX: Push camera away from walls
-    // Check if camera (eye position, which is ~at head height) is too close to solid
-    float minClearance = 0.3f;  // Minimum distance from solid surfaces
+    // --- CAMERA CLIPPING FIX ---
+    // Push camera away from walls if too close
+    float minClearance = 0.25f;
     float sdfAtEye = sampleSDF(chunkManager, position);
 
     if (sdfAtEye > -minClearance) {
-        // Too close to or inside solid - push back
-        // Sample SDF in multiple directions to find the push-out direction
-        glm::vec3 forward = getForward();
-        glm::vec3 right = getRight();
-        glm::vec3 up = getUp();
+        glm::vec3 eyeNormal = -calculateSDFNormal(chunkManager, position);
+        float pushAmount = (minClearance - sdfAtEye);
+        position += eyeNormal * pushAmount * 1.5f;
+    }
 
-        // Calculate gradient (normal of nearest surface)
-        float step = 0.1f;
-        float dx = sampleSDF(chunkManager, position + right * step) -
-                   sampleSDF(chunkManager, position - right * step);
-        float dy = sampleSDF(chunkManager, position + up * step) -
-                   sampleSDF(chunkManager, position - up * step);
-        float dz = sampleSDF(chunkManager, position + forward * step) -
-                   sampleSDF(chunkManager, position - forward * step);
-
-        glm::vec3 gradient(dx, dy, dz);
-        float gradLen = glm::length(gradient);
-
-        if (gradLen > 0.001f) {
-            // Push away from surface along gradient
-            glm::vec3 pushDirection = -gradient / gradLen;  // Point away from solid
-            float pushAmount = minClearance - sdfAtEye;
-            position += pushDirection * pushAmount * 2.0f;  // Push out with some extra margin
-        }
+    // --- UNSTUCK MECHANISM ---
+    // If deeply embedded in geometry, do aggressive push-out
+    if (sdfAtCenter > 0.5f) {
+        glm::vec3 escapeNormal = -calculateSDFNormal(chunkManager, position);
+        position += escapeNormal * sdfAtCenter * 3.0f;
+        velocity = glm::vec3(0);  // Kill all velocity when unsticking
     }
 }

@@ -24,6 +24,8 @@ public:
     float playerRadius;
     bool onGround;
     bool noclip;  // Toggle for free-fly vs physics mode
+    float maxWalkableSlope;  // Maximum slope angle in degrees
+    glm::vec3 groundNormal;  // Surface normal of ground we're standing on
 
     Camera(glm::vec3 startPosition = glm::vec3(0.0f, 20.0f, 10.0f));
 
