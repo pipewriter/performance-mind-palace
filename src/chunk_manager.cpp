@@ -33,8 +33,9 @@ VolumeChunk* ChunkManager::getChunk(ChunkCoord coord) {
     return nullptr;
 }
 
-void ChunkManager::updateChunks(glm::vec3 cameraPos, int loadRadius) {
+std::vector<VolumeChunk*> ChunkManager::updateChunks(glm::vec3 cameraPos, int loadRadius, int unloadRadius) {
     ChunkCoord cameraChunk = worldToChunkCoord(cameraPos);
+    std::vector<VolumeChunk*> newChunks;
 
     // Load chunks in a cube around camera
     for (int dx = -loadRadius; dx <= loadRadius; dx++) {
@@ -46,13 +47,42 @@ void ChunkManager::updateChunks(glm::vec3 cameraPos, int loadRadius) {
                     cameraChunk.z + dz
                 };
 
-                // Create chunk if it doesn't exist
-                getOrCreateChunk(coord);
+                // Check if chunk already exists
+                auto it = chunks.find(coord);
+                if (it == chunks.end()) {
+                    // New chunk - create and add to list
+                    VolumeChunk* chunk = getOrCreateChunk(coord);
+                    newChunks.push_back(chunk);
+                }
             }
         }
     }
 
-    // TODO: Unload distant chunks (Phase 5)
+    // Unload distant chunks
+    std::vector<ChunkCoord> toRemove;
+    for (const auto& [coord, chunk] : chunks) {
+        int dx = coord.x - cameraChunk.x;
+        int dy = coord.y - cameraChunk.y;
+        int dz = coord.z - cameraChunk.z;
+
+        // Check if outside unload radius
+        if (abs(dx) > unloadRadius || abs(dy) > unloadRadius || abs(dz) > unloadRadius) {
+            toRemove.push_back(coord);
+        }
+    }
+
+    // Remove chunks marked for removal
+    for (const auto& coord : toRemove) {
+        chunks.erase(coord);
+    }
+
+    // Log summary if anything changed
+    if (!newChunks.empty() || !toRemove.empty()) {
+        std::cout << "Chunk update: +" << newChunks.size() << " loaded, -" << toRemove.size()
+                  << " unloaded (total: " << chunks.size() << ")" << std::endl;
+    }
+
+    return newChunks;
 }
 
 void ChunkManager::clear() {

@@ -248,13 +248,13 @@ private:
         startTime = std::chrono::steady_clock::now();
         lastFpsTime = startTime;
 
-        // Generate initial chunks for testing
+        // Generate initial chunks (reduced for testing)
         std::cout << "\n=== Generating initial chunks ===" << std::endl;
-        chunkManager.updateChunks(camera.position, 2);  // Load 5x5x5 chunks around camera
+        auto newChunks = chunkManager.updateChunks(camera.position, 1, 3);  // Load radius 1, unload radius 3
         std::cout << "Total chunks loaded: " << chunkManager.getChunks().size() << std::endl;
         std::cout << "===================================\n" << std::endl;
 
-        // Generate meshes for all chunks and upload to GPU
+        // Generate meshes for all initial chunks
         std::cout << "\n=== Generating Meshes ===" << std::endl;
         int totalVertices = 0;
         int chunksWithGeometry = 0;
@@ -1398,7 +1398,30 @@ private:
             // Update chunks periodically (every 0.5 seconds)
             float timeSinceChunkUpdate = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastChunkUpdateTime).count();
             if (timeSinceChunkUpdate > 0.5f) {
-                chunkManager.updateChunks(camera.position, 2);
+                // Clean up GPU resources for chunks that will be removed
+                ChunkCoord cameraChunk = worldToChunkCoord(camera.position);
+                std::vector<ChunkCoord> toCleanup;
+                for (const auto& [coord, chunk] : chunkManager.getChunks()) {
+                    int dx = coord.x - cameraChunk.x;
+                    int dy = coord.y - cameraChunk.y;
+                    int dz = coord.z - cameraChunk.z;
+                    if (abs(dx) > 3 || abs(dy) > 3 || abs(dz) > 3) {  // Unload radius = 3
+                        if (chunk->vertexBuffer != VK_NULL_HANDLE) {
+                            vkDestroyBuffer(device, chunk->vertexBuffer, nullptr);
+                            vkFreeMemory(device, chunk->vertexBufferMemory, nullptr);
+                        }
+                        toCleanup.push_back(coord);
+                    }
+                }
+
+                // Update chunks (this will unload distant ones)
+                auto newChunks = chunkManager.updateChunks(camera.position, 1, 3);
+
+                // Generate meshes for newly loaded chunks
+                for (VolumeChunk* chunk : newChunks) {
+                    generateChunkMesh(chunk);
+                }
+
                 lastChunkUpdateTime = currentTime;
             }
 

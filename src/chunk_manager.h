@@ -15,11 +15,17 @@ public:
     // Get chunk without creating
     VolumeChunk* getChunk(ChunkCoord coord);
 
-    // Load chunks around a position
-    void updateChunks(glm::vec3 cameraPos, int loadRadius);
+    // Load chunks around a position and unload distant ones
+    // Returns newly loaded chunks (for mesh generation)
+    std::vector<VolumeChunk*> updateChunks(glm::vec3 cameraPos, int loadRadius, int unloadRadius);
 
     // Get all loaded chunks
     const std::unordered_map<ChunkCoord, std::unique_ptr<VolumeChunk>>& getChunks() const {
+        return chunks;
+    }
+
+    // Non-const version for modifications
+    std::unordered_map<ChunkCoord, std::unique_ptr<VolumeChunk>>& getChunks() {
         return chunks;
     }
 

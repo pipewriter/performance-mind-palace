@@ -11,7 +11,9 @@ public:
     void generateChunk(VolumeChunk& chunk);
 
 private:
-    FastNoiseLite noise;
+    FastNoiseLite terrainNoise;    // Large-scale terrain shapes
+    FastNoiseLite caveNoise;       // Cave systems
+    FastNoiseLite detailNoise;     // Small-scale detail
 
     // Generate SDF value at a world position
     float generateSDF(glm::vec3 worldPos);

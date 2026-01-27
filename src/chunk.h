@@ -6,9 +6,10 @@
 #include <functional>
 
 // Chunk size constants
-constexpr int CHUNK_SIZE = 32;      // 32x32x32 voxel grid
+constexpr int CHUNK_CUBES = 32;     // 32x32x32 marching cubes grid
+constexpr int CHUNK_SIZE = CHUNK_CUBES + 1;  // 33x33x33 voxel grid (need +1 for cube corners)
 constexpr float CHUNK_WORLD_SIZE = 16.0f;  // 16 meters per chunk
-constexpr float VOXEL_SIZE = CHUNK_WORLD_SIZE / CHUNK_SIZE;  // Size of each voxel in world space
+constexpr float VOXEL_SIZE = CHUNK_WORLD_SIZE / CHUNK_CUBES;  // Size of each cube (0.5m)
 
 // Chunk coordinate in chunk space (not world space)
 struct ChunkCoord {
