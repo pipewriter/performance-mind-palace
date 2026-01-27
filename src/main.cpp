@@ -21,6 +21,10 @@
 #include <chrono>
 #include <cstring>
 
+#include "camera.h"
+#include "chunk_manager.h"
+#include "marching_cubes.h"
+
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
 const int MAX_FRAMES_IN_FLIGHT = 2;
@@ -171,9 +175,37 @@ private:
     std::chrono::steady_clock::time_point lastFpsTime;
     uint32_t frameCount = 0;
 
+    // Camera
+    Camera camera;
+    double lastMouseX = 400.0;
+    double lastMouseY = 300.0;
+    bool firstMouse = true;
+
+    // Chunk system
+    ChunkManager chunkManager;
+    MarchingCubes marchingCubes;
+
     static void framebufferResizeCallback(GLFWwindow* window, int /*width*/, int /*height*/) {
         auto app = reinterpret_cast<VulkanApp*>(glfwGetWindowUserPointer(window));
         app->framebufferResized = true;
+    }
+
+    static void mouseCallback(GLFWwindow* window, double xpos, double ypos) {
+        auto app = reinterpret_cast<VulkanApp*>(glfwGetWindowUserPointer(window));
+
+        if (app->firstMouse) {
+            app->lastMouseX = xpos;
+            app->lastMouseY = ypos;
+            app->firstMouse = false;
+        }
+
+        float xoffset = xpos - app->lastMouseX;
+        float yoffset = app->lastMouseY - ypos;  // Reversed: y ranges bottom to top
+
+        app->lastMouseX = xpos;
+        app->lastMouseY = ypos;
+
+        app->camera.processMouseMovement(xoffset, yoffset);
     }
 
     void initWindow() {
@@ -183,9 +215,13 @@ private:
         // Don't create an OpenGL context
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
-        window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan Triangle", nullptr, nullptr);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan Marching Cubes", nullptr, nullptr);
         glfwSetWindowUserPointer(window, this);
         glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+
+        // Capture mouse for camera control
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        glfwSetCursorPosCallback(window, mouseCallback);
     }
 
     void initVulkan() {
@@ -211,6 +247,32 @@ private:
 
         startTime = std::chrono::steady_clock::now();
         lastFpsTime = startTime;
+
+        // Generate initial chunks for testing
+        std::cout << "\n=== Generating initial chunks ===" << std::endl;
+        chunkManager.updateChunks(camera.position, 2);  // Load 5x5x5 chunks around camera
+        std::cout << "Total chunks loaded: " << chunkManager.getChunks().size() << std::endl;
+        std::cout << "===================================\n" << std::endl;
+
+        // Generate meshes for all chunks and upload to GPU
+        std::cout << "\n=== Generating Meshes ===" << std::endl;
+        int totalVertices = 0;
+        int chunksWithGeometry = 0;
+
+        for (auto& [coord, chunk] : chunkManager.getChunks()) {
+            generateChunkMesh(chunk.get());
+
+            if (chunk->vertexCount > 0) {
+                chunksWithGeometry++;
+                totalVertices += chunk->vertexCount;
+            }
+        }
+
+        std::cout << "Generated meshes for " << chunksWithGeometry << "/" << chunkManager.getChunks().size()
+                  << " chunks" << std::endl;
+        std::cout << "Total vertices: " << totalVertices
+                  << " (" << (totalVertices / 3) << " triangles)" << std::endl;
+        std::cout << "===================================\n" << std::endl;
     }
 
     void createInstance() {
@@ -914,6 +976,47 @@ private:
         std::cout << "Index buffer created!" << std::endl;
     }
 
+    void generateChunkMesh(VolumeChunk* chunk) {
+        // Generate mesh from SDF
+        auto vertices = marchingCubes.generateMesh(*chunk);
+
+        if (vertices.empty()) {
+            chunk->vertexCount = 0;
+            chunk->meshGenerated = true;
+            return;
+        }
+
+        // Create vertex buffer for this chunk
+        VkDeviceSize bufferSize = sizeof(MarchingCubesVertex) * vertices.size();
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, vertices.data(), (size_t) bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        VkBuffer chunkVertexBuffer;
+        VkDeviceMemory chunkVertexBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, chunkVertexBuffer, chunkVertexBufferMemory);
+
+        copyBuffer(stagingBuffer, chunkVertexBuffer, bufferSize);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+
+        // Store in chunk
+        chunk->vertexBuffer = chunkVertexBuffer;
+        chunk->vertexBufferMemory = chunkVertexBufferMemory;
+        chunk->vertexCount = static_cast<uint32_t>(vertices.size());
+        chunk->meshGenerated = true;
+    }
+
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1150,13 +1253,19 @@ private:
         scissor.extent = swapChainExtent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-        VkBuffer vertexBuffers[] = {vertexBuffer};
-        VkDeviceSize offsets[] = {0};
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-        vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
-
+        // Bind descriptor sets (uniforms)
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
-        vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+
+        // Draw all chunks
+        VkDeviceSize offsets[] = {0};
+        for (const auto& [coord, chunk] : chunkManager.getChunks()) {
+            if (chunk->vertexCount > 0 && chunk->vertexBuffer != VK_NULL_HANDLE) {
+                VkBuffer vertexBuffers[] = {chunk->vertexBuffer};
+                vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+                vkCmdDraw(commandBuffer, chunk->vertexCount, 1, 0, 0);
+            }
+        }
+
         vkCmdEndRenderPass(commandBuffer);
 
         if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
@@ -1165,13 +1274,10 @@ private:
     }
 
     void updateUniformBuffer(uint32_t currentImage) {
-        auto currentTime = std::chrono::steady_clock::now();
-        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
-
         UniformBufferObject ubo{};
-        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 1.0f));
-        ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
-        ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float) swapChainExtent.height, 0.1f, 10.0f);
+        ubo.model = glm::mat4(1.0f);  // Identity - no rotation
+        ubo.view = camera.getViewMatrix();
+        ubo.proj = glm::perspective(glm::radians(60.0f), swapChainExtent.width / (float) swapChainExtent.height, 0.1f, 1000.0f);
         ubo.proj[1][1] *= -1;  // GLM was designed for OpenGL, flip Y for Vulkan
 
         memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
@@ -1276,17 +1382,41 @@ private:
     }
 
     void mainLoop() {
+        auto lastFrameTime = std::chrono::steady_clock::now();
+        auto lastChunkUpdateTime = std::chrono::steady_clock::now();
+
         while (!glfwWindowShouldClose(window)) {
+            auto currentTime = std::chrono::steady_clock::now();
+            float deltaTime = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastFrameTime).count();
+            lastFrameTime = currentTime;
+
             glfwPollEvents();
+
+            // Process camera input
+            camera.processKeyboard(window, deltaTime);
+
+            // Update chunks periodically (every 0.5 seconds)
+            float timeSinceChunkUpdate = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastChunkUpdateTime).count();
+            if (timeSinceChunkUpdate > 0.5f) {
+                chunkManager.updateChunks(camera.position, 2);
+                lastChunkUpdateTime = currentTime;
+            }
+
             drawFrame();
 
+            // FPS counter
             frameCount++;
-            auto currentTime = std::chrono::steady_clock::now();
             float elapsed = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastFpsTime).count();
 
             if (elapsed >= 1.0f) {
                 float fps = frameCount / elapsed;
-                std::cout << "FPS: " << fps << std::endl;
+                ChunkCoord cameraChunk = worldToChunkCoord(camera.position);
+                std::cout << "FPS: " << fps << " | Camera pos: ("
+                         << camera.position.x << ", "
+                         << camera.position.y << ", "
+                         << camera.position.z << ") | Chunk: ("
+                         << cameraChunk.x << ", " << cameraChunk.y << ", " << cameraChunk.z
+                         << ") | Loaded chunks: " << chunkManager.getChunks().size() << std::endl;
                 frameCount = 0;
                 lastFpsTime = currentTime;
             }
@@ -1296,6 +1426,14 @@ private:
 
     void cleanup() {
         cleanupSwapChain();
+
+        // Clean up chunk meshes
+        for (auto& [coord, chunk] : chunkManager.getChunks()) {
+            if (chunk->vertexBuffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(device, chunk->vertexBuffer, nullptr);
+                vkFreeMemory(device, chunk->vertexBufferMemory, nullptr);
+            }
+        }
 
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);

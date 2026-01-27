@@ -26,15 +26,26 @@ FetchContent_Declare(
     GIT_TAG 0.9.9.8
 )
 
-FetchContent_MakeAvailable(glfw glm)
+FetchContent_Declare(
+    FastNoiseLite
+    GIT_REPOSITORY https://github.com/Auburn/FastNoiseLite.git
+    GIT_TAG v1.1.1
+)
+
+FetchContent_MakeAvailable(glfw glm FastNoiseLite)
 
 # Main executable
 add_executable(vulkan_app
     src/main.cpp
+    src/camera.cpp
+    src/volume_generator.cpp
+    src/chunk_manager.cpp
+    src/marching_cubes.cpp
 )
 
 target_include_directories(vulkan_app PRIVATE
     ${Vulkan_INCLUDE_DIRS}
+    ${fastnoiselite_SOURCE_DIR}/Cpp
 )
 
 target_link_libraries(vulkan_app PRIVATE
