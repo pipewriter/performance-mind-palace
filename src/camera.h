@@ -4,16 +4,28 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+// Forward declaration
+class ChunkManager;
+
 class Camera {
 public:
     glm::vec3 position;
+    glm::vec3 velocity;  // Physics velocity
     float pitch;  // Up/down rotation (radians)
     float yaw;    // Left/right rotation (radians)
 
     float movementSpeed;
     float mouseSensitivity;
 
-    Camera(glm::vec3 startPosition = glm::vec3(0.0f, 5.0f, 10.0f));
+    // Physics parameters
+    float gravity;
+    float jumpStrength;
+    float playerHeight;
+    float playerRadius;
+    bool onGround;
+    bool noclip;  // Toggle for free-fly vs physics mode
+
+    Camera(glm::vec3 startPosition = glm::vec3(0.0f, 20.0f, 10.0f));
 
     // Get the view matrix for rendering
     glm::mat4 getViewMatrix() const;
@@ -28,6 +40,12 @@ public:
 
     // Process mouse movement (look around)
     void processMouseMovement(float xoffset, float yoffset);
+
+    // Physics update with collision detection
+    void updatePhysics(float deltaTime, ChunkManager& chunkManager);
+
+    // Jump if on ground
+    void jump();
 
 private:
     void updateVectors();

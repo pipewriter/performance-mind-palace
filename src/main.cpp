@@ -248,9 +248,9 @@ private:
         startTime = std::chrono::steady_clock::now();
         lastFpsTime = startTime;
 
-        // Generate initial chunks (reduced for testing)
+        // Generate initial chunks (start small, will load more as you move)
         std::cout << "\n=== Generating initial chunks ===" << std::endl;
-        auto newChunks = chunkManager.updateChunks(camera.position, 1, 3);  // Load radius 1, unload radius 3
+        auto newChunks = chunkManager.updateChunks(camera.position, 1, 4);  // Start with 1 chunk radius
         std::cout << "Total chunks loaded: " << chunkManager.getChunks().size() << std::endl;
         std::cout << "===================================\n" << std::endl;
 
@@ -273,6 +273,16 @@ private:
         std::cout << "Total vertices: " << totalVertices
                   << " (" << (totalVertices / 3) << " triangles)" << std::endl;
         std::cout << "===================================\n" << std::endl;
+
+        // Show controls
+        std::cout << "\n=== CONTROLS ===" << std::endl;
+        std::cout << "WASD - Move" << std::endl;
+        std::cout << "Space - Jump" << std::endl;
+        std::cout << "Mouse - Look around" << std::endl;
+        std::cout << "N - Toggle noclip (free fly mode)" << std::endl;
+        std::cout << "ESC - Exit" << std::endl;
+        std::cout << "Physics enabled! You'll fall to the ground." << std::endl;
+        std::cout << "================\n" << std::endl;
     }
 
     void createInstance() {
@@ -1395,17 +1405,22 @@ private:
             // Process camera input
             camera.processKeyboard(window, deltaTime);
 
+            // Update physics (gravity, collision)
+            camera.updatePhysics(deltaTime, chunkManager);
+
             // Update chunks periodically (every 0.5 seconds)
             float timeSinceChunkUpdate = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastChunkUpdateTime).count();
             if (timeSinceChunkUpdate > 0.5f) {
-                // Clean up GPU resources for chunks that will be removed
+                // Clean up GPU resources for chunks that will be removed (only very distant ones)
                 ChunkCoord cameraChunk = worldToChunkCoord(camera.position);
                 std::vector<ChunkCoord> toCleanup;
+                int horizontalUnload = 4;
+                int verticalUnload = 8;  // 2× horizontal to prevent thrashing when falling
                 for (const auto& [coord, chunk] : chunkManager.getChunks()) {
                     int dx = coord.x - cameraChunk.x;
                     int dy = coord.y - cameraChunk.y;
                     int dz = coord.z - cameraChunk.z;
-                    if (abs(dx) > 3 || abs(dy) > 3 || abs(dz) > 3) {  // Unload radius = 3
+                    if (abs(dx) > horizontalUnload || abs(dy) > verticalUnload || abs(dz) > horizontalUnload) {
                         if (chunk->vertexBuffer != VK_NULL_HANDLE) {
                             vkDestroyBuffer(device, chunk->vertexBuffer, nullptr);
                             vkFreeMemory(device, chunk->vertexBufferMemory, nullptr);
@@ -1414,8 +1429,8 @@ private:
                     }
                 }
 
-                // Update chunks (this will unload distant ones)
-                auto newChunks = chunkManager.updateChunks(camera.position, 1, 3);
+                // Update chunks (load 1 chunk ahead, keep until 4 away for caching)
+                auto newChunks = chunkManager.updateChunks(camera.position, 1, 4);
 
                 // Generate meshes for newly loaded chunks
                 for (VolumeChunk* chunk : newChunks) {

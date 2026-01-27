@@ -37,9 +37,10 @@ std::vector<VolumeChunk*> ChunkManager::updateChunks(glm::vec3 cameraPos, int lo
     ChunkCoord cameraChunk = worldToChunkCoord(cameraPos);
     std::vector<VolumeChunk*> newChunks;
 
-    // Load chunks in a cube around camera
+    // Load chunks - use smaller vertical radius (don't need chunks far above/below)
+    int verticalRadius = 1;  // Only load 1 chunk above/below
     for (int dx = -loadRadius; dx <= loadRadius; dx++) {
-        for (int dy = -loadRadius; dy <= loadRadius; dy++) {
+        for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
             for (int dz = -loadRadius; dz <= loadRadius; dz++) {
                 ChunkCoord coord = {
                     cameraChunk.x + dx,
@@ -58,15 +59,16 @@ std::vector<VolumeChunk*> ChunkManager::updateChunks(glm::vec3 cameraPos, int lo
         }
     }
 
-    // Unload distant chunks
+    // Unload distant chunks (use larger vertical unload radius)
     std::vector<ChunkCoord> toRemove;
+    int verticalUnloadRadius = unloadRadius * 2;  // Keep more chunks vertically to prevent thrashing
     for (const auto& [coord, chunk] : chunks) {
         int dx = coord.x - cameraChunk.x;
         int dy = coord.y - cameraChunk.y;
         int dz = coord.z - cameraChunk.z;
 
-        // Check if outside unload radius
-        if (abs(dx) > unloadRadius || abs(dy) > unloadRadius || abs(dz) > unloadRadius) {
+        // Check if outside unload radius (different for vertical)
+        if (abs(dx) > unloadRadius || abs(dy) > verticalUnloadRadius || abs(dz) > unloadRadius) {
             toRemove.push_back(coord);
         }
     }
