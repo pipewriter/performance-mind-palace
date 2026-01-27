@@ -26,6 +26,7 @@ public:
     bool noclip;  // Toggle for free-fly vs physics mode
     float maxWalkableSlope;  // Maximum slope angle in degrees
     glm::vec3 groundNormal;  // Surface normal of ground we're standing on
+    int jumpsRemaining;  // For double jump (2 = can double jump, 1 = used first jump, 0 = can't jump)
 
     Camera(glm::vec3 startPosition = glm::vec3(0.0f, 20.0f, 10.0f));
 

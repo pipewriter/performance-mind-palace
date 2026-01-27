@@ -18,6 +18,7 @@ Camera::Camera(glm::vec3 startPosition)
     , noclip(false)  // Start with physics enabled (press N to toggle noclip)
     , maxWalkableSlope(50.0f)  // 50 degrees max slope (Source engine uses ~45-50)
     , groundNormal(0, 1, 0)  // Default up
+    , jumpsRemaining(2)  // Start with double jump available
 {
 }
 
@@ -152,8 +153,12 @@ void Camera::processMouseMovement(float xoffset, float yoffset) {
 }
 
 void Camera::jump() {
-    if (onGround && !noclip) {
+    if (noclip) return;
+
+    // Can jump if we have jumps remaining (includes double jump)
+    if (jumpsRemaining > 0) {
         velocity.y = jumpStrength;
+        jumpsRemaining--;
         onGround = false;
     }
 }
@@ -244,21 +249,28 @@ void Camera::updatePhysics(float deltaTime, ChunkManager& chunkManager) {
 
     onGround = false;
 
-    if (sdfAtFeet > -0.2f && velocity.y <= 0.1f) {
+    // Generous ground detection range
+    if (sdfAtFeet > -0.5f && velocity.y <= 0.5f) {
         // Near or in ground - calculate ground normal
         groundNormal = -calculateSDFNormal(chunkManager, feetPos);  // Invert (points away from solid)
 
         // Check slope angle
-        float slopeAngle = glm::degrees(std::acos(glm::dot(groundNormal, glm::vec3(0, 1, 0))));
+        float slopeAngle = glm::degrees(std::acos(glm::clamp(glm::dot(groundNormal, glm::vec3(0, 1, 0)), -1.0f, 1.0f)));
 
         if (slopeAngle <= maxWalkableSlope) {
-            // Walkable slope - snap to ground
+            // Walkable slope
             onGround = true;
+            jumpsRemaining = 2;  // Reset double jump when on ground
             velocity.y = 0.0f;
 
-            // Push out of ground if embedded
-            if (sdfAtFeet > 0.0f) {
-                newPosition.y += sdfAtFeet * 1.5f;  // Push up
+            // Gentle push out of ground if embedded (smooth correction)
+            if (sdfAtFeet > 0.05f) {
+                // Only correct if significantly embedded
+                float correction = sdfAtFeet * 0.5f;  // Gentler correction (50% instead of 150%)
+                newPosition.y += correction;
+            } else if (sdfAtFeet > -0.1f) {
+                // Very close to surface - snap gently to prevent jitter
+                newPosition.y -= sdfAtFeet * 0.3f;
             }
         } else {
             // Too steep - slide down
@@ -306,12 +318,13 @@ void Camera::updatePhysics(float deltaTime, ChunkManager& chunkManager) {
 
     // --- WALL COLLISION WITH SLIDING ---
     float sdfAtCenter = sampleSDF(chunkManager, newPosition);
-    if (sdfAtCenter > 0.0f) {
+    if (sdfAtCenter > 0.05f) {  // Only correct if meaningfully inside wall
         // Inside wall - calculate wall normal and slide along it
         glm::vec3 wallNormal = -calculateSDFNormal(chunkManager, newPosition);
 
-        // Push out of wall
-        newPosition += wallNormal * sdfAtCenter * 2.0f;
+        // Gentle push out of wall (smooth correction)
+        float pushAmount = sdfAtCenter * 0.7f;  // Gentler than before
+        newPosition += wallNormal * pushAmount;
 
         // Project velocity along wall (slide)
         glm::vec3 slideVel = velocity - wallNormal * glm::dot(velocity, wallNormal);
@@ -322,21 +335,24 @@ void Camera::updatePhysics(float deltaTime, ChunkManager& chunkManager) {
     position = newPosition;
 
     // --- CAMERA CLIPPING FIX ---
-    // Push camera away from walls if too close
-    float minClearance = 0.25f;
+    // Push camera away from walls if too close (very gentle)
+    float minClearance = 0.2f;
     float sdfAtEye = sampleSDF(chunkManager, position);
 
-    if (sdfAtEye > -minClearance) {
+    if (sdfAtEye > -minClearance && sdfAtEye < minClearance * 0.5f) {
         glm::vec3 eyeNormal = -calculateSDFNormal(chunkManager, position);
-        float pushAmount = (minClearance - sdfAtEye);
-        position += eyeNormal * pushAmount * 1.5f;
+        float pushAmount = (minClearance - sdfAtEye) * 0.3f;  // Very gentle push
+        position += eyeNormal * pushAmount;
     }
 
     // --- UNSTUCK MECHANISM ---
-    // If deeply embedded in geometry, do aggressive push-out
-    if (sdfAtCenter > 0.5f) {
+    // If deeply embedded in geometry, do gradual push-out (not instant)
+    if (sdfAtCenter > 0.8f) {
         glm::vec3 escapeNormal = -calculateSDFNormal(chunkManager, position);
-        position += escapeNormal * sdfAtCenter * 3.0f;
-        velocity = glm::vec3(0);  // Kill all velocity when unsticking
+        float escapeAmount = (sdfAtCenter - 0.8f) * 2.0f;  // Gradual, not instant
+        position += escapeNormal * escapeAmount;
+
+        // Reduce velocity when unsticking, but don't kill it entirely
+        velocity *= 0.5f;
     }
 }

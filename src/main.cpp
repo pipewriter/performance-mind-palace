@@ -277,7 +277,7 @@ private:
         // Show controls
         std::cout << "\n=== CONTROLS ===" << std::endl;
         std::cout << "WASD - Move" << std::endl;
-        std::cout << "Space - Jump" << std::endl;
+        std::cout << "Space - Jump (press again in air for double jump!)" << std::endl;
         std::cout << "Mouse - Look around" << std::endl;
         std::cout << "N - Toggle noclip (free fly mode)" << std::endl;
         std::cout << "ESC - Exit" << std::endl;
