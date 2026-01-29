@@ -263,14 +263,21 @@ void Camera::updatePhysics(float deltaTime, ChunkManager& chunkManager) {
             jumpsRemaining = 2;  // Reset double jump when on ground
             velocity.y = 0.0f;
 
-            // Gentle push out of ground if embedded (smooth correction)
-            if (sdfAtFeet > 0.05f) {
-                // Only correct if significantly embedded
-                float correction = sdfAtFeet * 0.5f;  // Gentler correction (50% instead of 150%)
-                newPosition.y += correction;
-            } else if (sdfAtFeet > -0.1f) {
-                // Very close to surface - snap gently to prevent jitter
-                newPosition.y -= sdfAtFeet * 0.3f;
+            // Keep a small clearance from the surface and correct along the surface normal.
+            const float groundTarget = -0.05f;  // Slightly above the surface
+            const float snapBand = 0.15f;  // Range to gently stick to ground
+            if (sdfAtFeet > groundTarget) {
+                float correction = (sdfAtFeet - groundTarget);
+                newPosition += groundNormal * correction;
+            } else if (sdfAtFeet > groundTarget - snapBand) {
+                float correction = (sdfAtFeet - groundTarget) * 0.5f;
+                newPosition += groundNormal * correction;
+            }
+
+            // Remove any velocity pushing into the ground to avoid slope jitter.
+            float intoGround = glm::dot(velocity, groundNormal);
+            if (intoGround < 0.0f) {
+                velocity -= groundNormal * intoGround;
             }
         } else {
             // Too steep - slide down
