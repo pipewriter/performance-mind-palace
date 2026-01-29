@@ -15,9 +15,6 @@ VolumeChunk* ChunkManager::getOrCreateChunk(ChunkCoord coord) {
     auto chunk = std::make_unique<VolumeChunk>();
     chunk->coord = coord;
 
-    // Generate volume data
-    generator.generateChunk(*chunk);
-
     // Store and return
     VolumeChunk* ptr = chunk.get();
     chunks[coord] = std::move(chunk);
@@ -69,7 +66,10 @@ std::vector<VolumeChunk*> ChunkManager::updateChunks(glm::vec3 cameraPos, int lo
 
         // Check if outside unload radius (different for vertical)
         if (abs(dx) > unloadRadius || abs(dy) > verticalUnloadRadius || abs(dz) > unloadRadius) {
-            toRemove.push_back(coord);
+            if (!chunk->generationQueued.load() && !chunk->generationInProgress.load() &&
+                !chunk->uploadInProgress.load()) {
+                toRemove.push_back(coord);
+            }
         }
     }
 

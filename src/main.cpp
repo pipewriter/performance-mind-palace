@@ -20,6 +20,11 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 
 #include "camera.h"
 #include "chunk_manager.h"
@@ -121,6 +126,19 @@ struct SwapChainSupportDetails {
     std::vector<VkPresentModeKHR> presentModes;
 };
 
+struct PendingMeshUpload {
+    ChunkCoord coord;
+    std::vector<MarchingCubesVertex> vertices;
+};
+
+struct PendingUpload {
+    ChunkCoord coord;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+};
+
 class VulkanApp {
 public:
     void run() {
@@ -185,6 +203,22 @@ private:
     ChunkManager chunkManager;
     MarchingCubes marchingCubes;
 
+    std::thread generationThread;
+    std::mutex generationMutex;
+    std::condition_variable generationCv;
+    std::queue<VolumeChunk*> generationQueue;
+
+    std::mutex completedMutex;
+    std::queue<PendingMeshUpload> completedMeshes;
+    std::atomic<bool> generationRunning{false};
+
+    std::vector<PendingUpload> pendingUploads;
+
+    float uploadWorkMsAccum = 0.0f;
+    int uploadFramesAccum = 0;
+    int uploadsSubmittedThisSecond = 0;
+    int fencesCompletedThisSecond = 0;
+
     static void framebufferResizeCallback(GLFWwindow* window, int /*width*/, int /*height*/) {
         auto app = reinterpret_cast<VulkanApp*>(glfwGetWindowUserPointer(window));
         app->framebufferResized = true;
@@ -248,31 +282,17 @@ private:
         startTime = std::chrono::steady_clock::now();
         lastFpsTime = startTime;
 
+        startGenerationWorker();
+
         // Generate initial chunks (start small, will load more as you move)
         std::cout << "\n=== Generating initial chunks ===" << std::endl;
         auto newChunks = chunkManager.updateChunks(camera.position, 1, 4);  // Start with 1 chunk radius
         std::cout << "Total chunks loaded: " << chunkManager.getChunks().size() << std::endl;
         std::cout << "===================================\n" << std::endl;
 
-        // Generate meshes for all initial chunks
-        std::cout << "\n=== Generating Meshes ===" << std::endl;
-        int totalVertices = 0;
-        int chunksWithGeometry = 0;
-
-        for (auto& [coord, chunk] : chunkManager.getChunks()) {
-            generateChunkMesh(chunk.get());
-
-            if (chunk->vertexCount > 0) {
-                chunksWithGeometry++;
-                totalVertices += chunk->vertexCount;
-            }
+        for (VolumeChunk* chunk : newChunks) {
+            enqueueChunkGeneration(chunk);
         }
-
-        std::cout << "Generated meshes for " << chunksWithGeometry << "/" << chunkManager.getChunks().size()
-                  << " chunks" << std::endl;
-        std::cout << "Total vertices: " << totalVertices
-                  << " (" << (totalVertices / 3) << " triangles)" << std::endl;
-        std::cout << "===================================\n" << std::endl;
 
         // Show controls
         std::cout << "\n=== CONTROLS ===" << std::endl;
@@ -283,6 +303,165 @@ private:
         std::cout << "ESC - Exit" << std::endl;
         std::cout << "Physics enabled! You'll fall to the ground." << std::endl;
         std::cout << "================\n" << std::endl;
+    }
+
+    void startGenerationWorker() {
+        generationRunning.store(true);
+        generationThread = std::thread([this]() { generationWorkerLoop(); });
+    }
+
+    void stopGenerationWorker() {
+        {
+            std::lock_guard<std::mutex> lock(generationMutex);
+            generationRunning.store(false);
+        }
+        generationCv.notify_all();
+        if (generationThread.joinable()) {
+            generationThread.join();
+        }
+    }
+
+    void enqueueChunkGeneration(VolumeChunk* chunk) {
+        if (!chunk) {
+            return;
+        }
+        bool expected = false;
+        if (!chunk->generationQueued.compare_exchange_strong(expected, true)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(generationMutex);
+            generationQueue.push(chunk);
+        }
+        generationCv.notify_one();
+    }
+
+    void generationWorkerLoop() {
+        while (true) {
+            VolumeChunk* chunk = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(generationMutex);
+                generationCv.wait(lock, [this]() {
+                    return !generationQueue.empty() || !generationRunning.load();
+                });
+                if (!generationRunning.load() && generationQueue.empty()) {
+                    break;
+                }
+                chunk = generationQueue.front();
+                generationQueue.pop();
+            }
+
+            if (!chunk) {
+                continue;
+            }
+
+            chunk->generationInProgress.store(true);
+            chunk->generationQueued.store(false);
+            chunkManager.generateChunkSdf(*chunk);
+            chunk->sdfReady.store(true);
+
+            auto vertices = marchingCubes.generateMesh(*chunk);
+            {
+                std::lock_guard<std::mutex> lock(completedMutex);
+                completedMeshes.push(PendingMeshUpload{chunk->coord, std::move(vertices)});
+            }
+
+            chunk->generationInProgress.store(false);
+        }
+    }
+
+    int processCompletedMeshes(float budgetMs, int maxUploads) {
+        if (budgetMs <= 0.0f || maxUploads <= 0) {
+            return 0;
+        }
+        auto start = std::chrono::steady_clock::now();
+        int submitted = 0;
+        for (int i = 0; i < maxUploads; ++i) {
+            auto now = std::chrono::steady_clock::now();
+            float elapsedMs = std::chrono::duration<float, std::milli>(now - start).count();
+            if (elapsedMs >= budgetMs) {
+                break;
+            }
+            PendingMeshUpload job;
+            {
+                std::lock_guard<std::mutex> lock(completedMutex);
+                if (completedMeshes.empty()) {
+                    break;
+                }
+                job = std::move(completedMeshes.front());
+                completedMeshes.pop();
+            }
+
+            VolumeChunk* chunk = chunkManager.getChunk(job.coord);
+            if (!chunk) {
+                continue;
+            }
+
+            if (chunk->vertexBuffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(device, chunk->vertexBuffer, nullptr);
+                vkFreeMemory(device, chunk->vertexBufferMemory, nullptr);
+                chunk->vertexBuffer = VK_NULL_HANDLE;
+                chunk->vertexBufferMemory = VK_NULL_HANDLE;
+            }
+
+            uploadChunkMesh(chunk, job.vertices);
+            submitted++;
+        }
+        return submitted;
+    }
+
+    int processUploadFences() {
+        int completed = 0;
+        for (size_t i = 0; i < pendingUploads.size(); ) {
+            PendingUpload& upload = pendingUploads[i];
+            VkResult status = vkGetFenceStatus(device, upload.fence);
+            if (status == VK_SUCCESS) {
+                vkFreeCommandBuffers(device, commandPool, 1, &upload.commandBuffer);
+                vkDestroyFence(device, upload.fence, nullptr);
+                vkDestroyBuffer(device, upload.stagingBuffer, nullptr);
+                vkFreeMemory(device, upload.stagingMemory, nullptr);
+
+                VolumeChunk* chunk = chunkManager.getChunk(upload.coord);
+                if (chunk) {
+                    chunk->meshUploaded = true;
+                    chunk->uploadInProgress.store(false);
+                }
+
+                pendingUploads[i] = pendingUploads.back();
+                pendingUploads.pop_back();
+                completed++;
+            } else {
+                ++i;
+            }
+        }
+        return completed;
+    }
+
+    void flushPendingUploads() {
+        for (PendingUpload& upload : pendingUploads) {
+            if (upload.fence != VK_NULL_HANDLE) {
+                vkWaitForFences(device, 1, &upload.fence, VK_TRUE, UINT64_MAX);
+            }
+            if (upload.commandBuffer != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(device, commandPool, 1, &upload.commandBuffer);
+            }
+            if (upload.fence != VK_NULL_HANDLE) {
+                vkDestroyFence(device, upload.fence, nullptr);
+            }
+            if (upload.stagingBuffer != VK_NULL_HANDLE) {
+                vkDestroyBuffer(device, upload.stagingBuffer, nullptr);
+            }
+            if (upload.stagingMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(device, upload.stagingMemory, nullptr);
+            }
+
+            VolumeChunk* chunk = chunkManager.getChunk(upload.coord);
+            if (chunk) {
+                chunk->meshUploaded = true;
+                chunk->uploadInProgress.store(false);
+            }
+        }
+        pendingUploads.clear();
     }
 
     void createInstance() {
@@ -986,13 +1165,12 @@ private:
         std::cout << "Index buffer created!" << std::endl;
     }
 
-    void generateChunkMesh(VolumeChunk* chunk) {
-        // Generate mesh from SDF
-        auto vertices = marchingCubes.generateMesh(*chunk);
-
+    void uploadChunkMesh(VolumeChunk* chunk, const std::vector<MarchingCubesVertex>& vertices) {
         if (vertices.empty()) {
             chunk->vertexCount = 0;
             chunk->meshGenerated = true;
+            chunk->meshUploaded = true;
+            chunk->uploadInProgress.store(false);
             return;
         }
 
@@ -1015,16 +1193,55 @@ private:
         createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, chunkVertexBuffer, chunkVertexBufferMemory);
 
-        copyBuffer(stagingBuffer, chunkVertexBuffer, bufferSize);
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandPool = commandPool;
+        allocInfo.commandBufferCount = 1;
 
-        vkDestroyBuffer(device, stagingBuffer, nullptr);
-        vkFreeMemory(device, stagingBufferMemory, nullptr);
+        VkCommandBuffer commandBuffer;
+        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.size = bufferSize;
+        vkCmdCopyBuffer(commandBuffer, stagingBuffer, chunkVertexBuffer, 1, &copyRegion);
+
+        vkEndCommandBuffer(commandBuffer);
+
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+
+        VkFence fence = VK_NULL_HANDLE;
+        vkCreateFence(device, &fenceInfo, nullptr, &fence);
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, fence);
 
         // Store in chunk
         chunk->vertexBuffer = chunkVertexBuffer;
         chunk->vertexBufferMemory = chunkVertexBufferMemory;
         chunk->vertexCount = static_cast<uint32_t>(vertices.size());
         chunk->meshGenerated = true;
+        chunk->meshUploaded = false;
+        chunk->uploadInProgress.store(true);
+
+        pendingUploads.push_back(PendingUpload{
+            chunk->coord,
+            stagingBuffer,
+            stagingBufferMemory,
+            fence,
+            commandBuffer
+        });
     }
 
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
@@ -1269,7 +1486,7 @@ private:
         // Draw all chunks
         VkDeviceSize offsets[] = {0};
         for (const auto& [coord, chunk] : chunkManager.getChunks()) {
-            if (chunk->vertexCount > 0 && chunk->vertexBuffer != VK_NULL_HANDLE) {
+            if (chunk->meshUploaded && chunk->vertexCount > 0 && chunk->vertexBuffer != VK_NULL_HANDLE) {
                 VkBuffer vertexBuffers[] = {chunk->vertexBuffer};
                 vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
                 vkCmdDraw(commandBuffer, chunk->vertexCount, 1, 0, 0);
@@ -1421,6 +1638,10 @@ private:
                     int dy = coord.y - cameraChunk.y;
                     int dz = coord.z - cameraChunk.z;
                     if (abs(dx) > horizontalUnload || abs(dy) > verticalUnload || abs(dz) > horizontalUnload) {
+                        if (chunk->generationQueued.load() || chunk->generationInProgress.load() ||
+                            chunk->uploadInProgress.load()) {
+                            continue;
+                        }
                         if (chunk->vertexBuffer != VK_NULL_HANDLE) {
                             vkDestroyBuffer(device, chunk->vertexBuffer, nullptr);
                             vkFreeMemory(device, chunk->vertexBufferMemory, nullptr);
@@ -1432,13 +1653,23 @@ private:
                 // Update chunks (load 1 chunk ahead, keep until 4 away for caching)
                 auto newChunks = chunkManager.updateChunks(camera.position, 1, 4);
 
-                // Generate meshes for newly loaded chunks
+                // Queue generation for newly loaded chunks
                 for (VolumeChunk* chunk : newChunks) {
-                    generateChunkMesh(chunk);
+                    enqueueChunkGeneration(chunk);
                 }
 
                 lastChunkUpdateTime = currentTime;
             }
+
+            auto uploadStart = std::chrono::steady_clock::now();
+            int submittedUploads = processCompletedMeshes(1.5f, 3);
+            int completedFences = processUploadFences();
+            auto uploadEnd = std::chrono::steady_clock::now();
+
+            uploadWorkMsAccum += std::chrono::duration<float, std::milli>(uploadEnd - uploadStart).count();
+            uploadFramesAccum++;
+            uploadsSubmittedThisSecond += submittedUploads;
+            fencesCompletedThisSecond += completedFences;
 
             drawFrame();
 
@@ -1449,20 +1680,40 @@ private:
             if (elapsed >= 1.0f) {
                 float fps = frameCount / elapsed;
                 ChunkCoord cameraChunk = worldToChunkCoord(camera.position);
+                size_t pendingUploadCount = pendingUploads.size();
+                size_t completedQueueSize = 0;
+                {
+                    std::lock_guard<std::mutex> lock(completedMutex);
+                    completedQueueSize = completedMeshes.size();
+                }
+                float avgUploadMs = uploadFramesAccum > 0 ? (uploadWorkMsAccum / uploadFramesAccum) : 0.0f;
                 std::cout << "FPS: " << fps << " | Camera pos: ("
                          << camera.position.x << ", "
                          << camera.position.y << ", "
                          << camera.position.z << ") | Chunk: ("
                          << cameraChunk.x << ", " << cameraChunk.y << ", " << cameraChunk.z
-                         << ") | Loaded chunks: " << chunkManager.getChunks().size() << std::endl;
+                         << ") | Loaded chunks: " << chunkManager.getChunks().size()
+                         << " | Upload avg ms: " << avgUploadMs
+                         << " | Uploads: +" << uploadsSubmittedThisSecond
+                         << " / done " << fencesCompletedThisSecond
+                         << " | Pending: " << pendingUploadCount
+                         << " | ReadyQ: " << completedQueueSize
+                         << std::endl;
                 frameCount = 0;
                 lastFpsTime = currentTime;
+                uploadWorkMsAccum = 0.0f;
+                uploadFramesAccum = 0;
+                uploadsSubmittedThisSecond = 0;
+                fencesCompletedThisSecond = 0;
             }
         }
         vkDeviceWaitIdle(device);
     }
 
     void cleanup() {
+        stopGenerationWorker();
+        flushPendingUploads();
+
         cleanupSwapChain();
 
         // Clean up chunk meshes

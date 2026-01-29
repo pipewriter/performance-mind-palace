@@ -19,6 +19,8 @@ public:
     // Returns newly loaded chunks (for mesh generation)
     std::vector<VolumeChunk*> updateChunks(glm::vec3 cameraPos, int loadRadius, int unloadRadius);
 
+    void generateChunkSdf(VolumeChunk& chunk) { generator.generateChunk(chunk); }
+
     // Get all loaded chunks
     const std::unordered_map<ChunkCoord, std::unique_ptr<VolumeChunk>>& getChunks() const {
         return chunks;

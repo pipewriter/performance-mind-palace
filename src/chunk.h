@@ -4,6 +4,7 @@
 #include <glm/glm.hpp>
 #include <cstdint>
 #include <functional>
+#include <atomic>
 
 // Chunk size constants
 constexpr int CHUNK_CUBES = 32;     // 32x32x32 marching cubes grid
@@ -53,6 +54,10 @@ struct VolumeChunk {
     // State flags
     bool meshGenerated = false;
     bool meshUploaded = false;
+    std::atomic<bool> sdfReady{false};
+    std::atomic<bool> generationQueued{false};
+    std::atomic<bool> generationInProgress{false};
+    std::atomic<bool> uploadInProgress{false};
 
     // Bounding box in world space
     glm::vec3 worldMin;

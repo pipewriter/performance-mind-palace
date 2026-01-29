@@ -175,6 +175,9 @@ float sampleSDF(const ChunkManager& chunkManager, glm::vec3 worldPos) {
     }
 
     const VolumeChunk* chunk = it->second.get();
+    if (!chunk->sdfReady.load()) {
+        return -10.0f;  // Chunk not generated yet
+    }
     glm::vec3 chunkWorldPos = chunkToWorldPos(chunkCoord);
     glm::vec3 localPos = worldPos - chunkWorldPos;
 
